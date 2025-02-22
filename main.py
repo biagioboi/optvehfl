@@ -1,38 +1,40 @@
 import numpy as np
 import pandas as pd
 import glob
-from scipy.optimize import minimize
 
-nodi_scelti = 0
 
 class BS:
     def __init__(self, id, prezzo_iniziale):
         self.id = id
-        self.price_per_tx_power = 5 # Pago 5 euro per ogni W di tx power
-        self.prezzo = prezzo_iniziale # Prezzo che il ML Provider deve pagarmi per ciascun utente servito
+        self.price_per_tx_power = 5  # Costo per ogni W di potenza trasmessa
+        self.prezzo = prezzo_iniziale  # Prezzo per utente servito
         self.tx_min = 1
         self.tx_max = 20
-        self.tx_power = 0
+        self.tx_power = 10  # Partiamo con un valore iniziale ragionevole
+        self.no_demand_rounds = 0  # Conta i round senza domanda
 
-    def feasible_comb(self, nodi, curr_tx):
-        amount_to_pay = curr_tx * self.price_per_tx_power
-        return amount_to_pay <= nodi * self.prezzo
+    def calcola_sinr(self, curr_tx):
+        return 4 * 10 ** 8 * np.log2(1 + curr_tx / 10 ** -17)
+
+    def calcola_throughput(self, nodi, curr_tx):
+        sinr = self.calcola_sinr(curr_tx)
+        return sinr / nodi if nodi > 0 else 0
 
     def bs_satisfied(self, nodi, curr_tx):
-        sinr = 4 * 10 ** 8 * np.log2(1 + curr_tx / 10 ** -17)
-        throughput = sinr / nodi
-        if throughput < 60:
-            return False, 0
-        while not self.feasible_comb(nodi, curr_tx):
-            self.prezzo = self.prezzo + 0.05
-        return True, throughput
+        throughput = self.calcola_throughput(nodi, curr_tx)
+        return throughput >= 60
 
-    def scegli_prezzo(self, nodi):
-        past_utility = nodi / 90 * nodi * self.prezzo
-        feasible, throughput = self.bs_satisfied(nodi, 10)
-        if past_utility >= (nodi / 90) * nodi * self.prezzo:
-            self.prezzo = self.prezzo - 0.05
-        print(f"Current gain {nodi / 90 * nodi * self.prezzo}")
+    def scegli_prezzo(self, nodi, ml_budget):
+        if nodi == 0:
+            self.no_demand_rounds += 1
+            if self.no_demand_rounds > 2:
+                self.prezzo = max(self.prezzo - 2, 0.001)  # Riduzione più aggressiva dopo 2 round senza domanda
+            else:
+                self.prezzo = max(self.prezzo - 4, 0.001)  # Riduzione standard
+        else:
+            self.no_demand_rounds = 0  # Resetta il contatore se c'è domanda
+            max_prezzo_possibile = ml_budget / nodi
+            self.prezzo = min(self.prezzo + 1, max_prezzo_possibile)  # Aumento più lento per evitare oscillazioni
 
         return self.prezzo
 
@@ -53,35 +55,41 @@ class MLProvider:
         return self.budget >= (utenti * bs.prezzo + iterazioni * self.price_per_iter)
 
     def scegli_nodi_iterazioni(self, bs):
-        if self.accuracy > 0:
-            current_best = {"accuracy": self.accuracy, "nodi": 0, "iterazioni": 0}
-        else:
-            current_best = {"accuracy": 0.00, "nodi": 0, "iterazioni": 0}
+        best_option = {"accuracy": 0.00, "nodi": 0, "iterazioni": 0}
+
         for x in range(self.min_iterazioni, self.max_iter):
             for y in range(self.min_utenti, self.max_utenti):
-                temp = self.df.loc[(df['num_nodes'] == y) & (df['round'] == x)]['accuracy'].iloc[0]
-                if temp > current_best["accuracy"]:
-                    if self.feasible_comb(bs, y, x):
-                        current_best["accuracy"] = temp
-                        current_best["nodi"] = y
-                        current_best["iterazioni"] = x
-        self.accuracy = current_best["accuracy"]
-        return current_best
+                df_filter = self.df.loc[(self.df['num_nodes'] == y) & (self.df['round'] == x)]
+                if df_filter.empty:
+                    continue  # Evita errori se il dataframe non ha dati
+
+                temp_accuracy = df_filter['accuracy'].iloc[0]
+                if temp_accuracy > best_option["accuracy"] and self.feasible_comb(bs, y, x):
+                    best_option.update({"accuracy": temp_accuracy, "nodi": y, "iterazioni": x})
+
+        self.accuracy = best_option["accuracy"]
+        return best_option
 
 
-file_pattern = "*.csv"  # Cambia se i file sono in una cartella diversa
+# Lettura dei dati da file CSV
+file_pattern = "data/*.csv"
 csv_files = glob.glob(file_pattern)
 df_list = [pd.read_csv(file) for file in csv_files]
 df = pd.concat(df_list, ignore_index=True)
+
+# Inizializzazione dei giocatori
 bs_player = BS(1, 0.001)
 ml_player = MLProvider(500, df)
+
 max_round = 100
 for i in range(1, max_round):
     current_best = ml_player.scegli_nodi_iterazioni(bs_player)
     ml_player.iterazioni = current_best["iterazioni"]
     ml_player.accuracy = current_best["accuracy"]
-    print(f"The best is {ml_player.iterazioni} and {ml_player.accuracy} with { current_best['nodi']}\n")
-
     nodi_scelti = current_best["nodi"]
-    bs_player.scegli_prezzo(nodi_scelti)
-    print(f"The new price is {bs_player.prezzo}\n")
+
+    print(
+        f"Round {i}: ML provider sceglie {ml_player.iterazioni} iterazioni, {nodi_scelti} nodi, accuracy {ml_player.accuracy:.4f}")
+
+    bs_player.scegli_prezzo(nodi_scelti, ml_player.budget)
+    print(f"Round {i}: BS aggiorna il prezzo a {bs_player.prezzo:.4f}\n")
